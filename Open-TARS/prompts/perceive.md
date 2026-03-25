@@ -18,6 +18,10 @@ Given the current screen and a goal, describe what you see and narrate how you w
 
 **═══ RULES ═══**
 - **Check if done first.** If the current screen already fully satisfies the goal (e.g., price is visible in memory, result is already displayed), output only `<done/>` — nothing else.
+- **Action goals are NOT done just because the target is visible.** Goals that say "tap", "click", "activate", "enter text into", or "type into" require the action to have been performed — not just the element to exist on screen. Examples:
+  - "Tap the search icon to activate the search field" → `<done/>` ONLY if the search field is already actively focused (cursor blinking, keyboard visible). Seeing the search bar visible is NOT done.
+  - "Enter '공주대학교' into the search bar and execute the search" → `<done/>` ONLY if search results for 공주대학교 are already showing. Search bar visible is NOT done.
+  - "Click the search bar" → `<done/>` only if search bar is focused and ready to type.
 - **Prose only** for the narrative. No numbered lists, no bullet points, no JSON.
 - Describe what is **actually on screen** — don't assume or hallucinate.
 - Cover: current app/page state, overall approach, key decision points.
