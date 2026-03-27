@@ -22,6 +22,7 @@ Given the current screen and a goal, describe what you see and narrate how you w
   - "Tap the search icon to activate the search field" → `<done/>` ONLY if the search field is already actively focused (cursor blinking, keyboard visible). Seeing the search bar visible is NOT done.
   - "Enter '공주대학교' into the search bar and execute the search" → `<done/>` ONLY if search results for 공주대학교 are already showing. Search bar visible is NOT done.
   - "Click the search bar" → `<done/>` only if search bar is focused and ready to type.
+- **Close/quit/hide goals require the window to be GONE.** "Close the Gmail window", "창 닫아줘", "quit the app" → `<done/>` ONLY if the window/app is no longer visible on screen. The window still being open = the task has NOT been done yet, even if the app is visible and ready.
 - **Prose only** for the narrative. No numbered lists, no bullet points, no JSON.
 - Describe what is **actually on screen** — don't assume or hallucinate.
 - Cover: current app/page state, overall approach, key decision points.

@@ -58,6 +58,12 @@ def execute_action(action: dict, screen: ScreenInfo, img: Image.Image | None) ->
 
     if t == "hotkey":
         keys = action["keys"]
+        # Focus guard for window-control hotkeys
+        _window_hotkeys = {"cmd w", "cmd q", "cmd m", "cmd h", "cmd `"}
+        norm = " ".join(sorted(k.strip().lower() for k in keys.replace("+", " ").split()))
+        if norm in _window_hotkeys:
+            focused = inp.get_focus()
+            print(f"      🔍 Focus check before {keys}: '{focused}'")
         print(f"      ⌨️  Hotkey: {keys}")
         return inp.hotkey(keys)
 

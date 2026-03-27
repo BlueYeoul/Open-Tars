@@ -27,6 +27,7 @@ from vision.screen import ScreenInfo, take_screenshot
 from vision.action_history import ActionHistory
 from vision.frame_diff import diff_image_b64
 from agent.state import AgentState, Todo
+from memory import VectorMemory
 import tools
 from action.toolboxes import CHECKPOINT_ERROR_SIGNALS, parse_response, resolve_actions, validate_plan
 
@@ -46,6 +47,7 @@ class Orchestrator:
         self._bus      = bus              # may be None (headless / test mode)
         self._history  = ActionHistory()  # mouse trail + text long-term memory
         self._prev_img: Image.Image | None = None  # previous frame for diff
+        self._vmem     = VectorMemory()   # semantic memory (Qwen3-VL embeddings)
 
     # ──────────────────────────────────────────────────────────────────
     # Bus helpers — all output funnels through here
@@ -109,6 +111,7 @@ class Orchestrator:
         self._aborted = False
         self._apps_str = format_app_list()
         self._history.clear()
+        self._vmem.clear()
         self._prev_img = None
         if self._bus:
             self._bus.reset_abort()
@@ -376,7 +379,7 @@ class Orchestrator:
                  diff_desc: str = "") -> str:
         """Fast 2-3 sentence screen observation, with optional diff context."""
         focused = get_focus()
-        mem = self._format_memory()
+        mem = self._format_memory(goal)
 
         # Build diff context for observer
         diff_block = ""
@@ -393,6 +396,11 @@ class Orchestrator:
             "Observe.", image=b64)
         self._push_tokens()
         self._log(f"    👁️ {raw[:250]}")
+
+        # Store observation with VL embedding (image + text → visual episodic memory)
+        obs_key = f"obs_{self._iter}"
+        self._vmem.add(obs_key, f"[Goal: {goal}] {raw[:400]}", image_b64=b64)
+
         return raw
 
     # ──────────────────────────────────────────────────────────────────
@@ -409,7 +417,7 @@ class Orchestrator:
         b64, _ = take_screenshot(self.screen)
         raw_p  = call_llm(
             load_prompt("perceive", goal=todo.description,
-                        memory_block=self._format_memory()),
+                        memory_block=self._format_memory(todo.description)),
             "Perceive and narrate.", image=b64)
         self._push_tokens()
 
@@ -430,6 +438,7 @@ class Orchestrator:
         fail_streak  = 0
         action_count = 0
         error_block  = ""
+        observation  = ""   # cached — reused if screen unchanged
 
         while action_count < MAX_ACTIONS_PER_GOAL and self._iter < self.max_iters:
             if self._aborted or (self._bus and self._bus.abort_requested):
@@ -439,29 +448,35 @@ class Orchestrator:
                 return
 
             b64, curr_img = take_screenshot(self.screen)
+            focused = get_focus()
 
             # Frame diff: compare with previous frame
             diff_desc = ""
+            screen_changed = True
             if self._prev_img is not None:
                 _, diff_desc = diff_image_b64(self._prev_img, curr_img)
-                if diff_desc != "no_change":
+                screen_changed = (diff_desc != "no_change")
+                if screen_changed:
                     self._log(f"    🔄 Diff: {diff_desc[:120]}")
 
-            # Observe (lightweight — replaces Consultant + Sensors)
-            self._status(phase="observe")
-            observation = self._observe(b64, todo.description, curr_img, diff_desc)
+            # Observe: skip if screen unchanged and we already have an observation
+            if screen_changed or not observation:
+                self._status(phase="observe")
+                observation = self._observe(b64, todo.description, curr_img, diff_desc)
 
-            # Check if observer detected goal completion
-            if re.search(r"<done\s*/>", observation):
-                todo.status = "done"
-                self._log("    ✅ Goal done! (observer)")
-                return
+                # Check if observer detected goal completion
+                if re.search(r"<done\s*/>", observation):
+                    todo.status = "done"
+                    self._log("    ✅ Goal done! (observer)")
+                    return
+            else:
+                self._log(f"    👁️ (screen unchanged — reusing observation)")
 
             # Tactician
             self._status(phase="tactician")
             actions, state, next_hint = self._plan_action(
                 b64, todo.description, daydream, past_actions,
-                error_block, next_hint, observation)
+                error_block, next_hint, observation, focused)
 
             if not actions:
                 fail_streak += 1
@@ -571,7 +586,7 @@ class Orchestrator:
     # ──────────────────────────────────────────────────────────────────
 
     def _plan_action(self, b64, goal, daydream, past_actions, error_block,
-                     next_hint="", observation=""):
+                     next_hint="", observation="", focused_app=""):
         past_block  = "\n".join(f"  - {a}" for a in past_actions[-6:]) or "  (nothing yet)"
         next_block  = next_hint or "(not specified)"
         local_error = error_block
@@ -581,11 +596,12 @@ class Orchestrator:
                 load_prompt("tactician",
                             goal=goal, daydream=daydream,
                             next_hint=next_block, past_actions=past_block,
-                            memory_block=self._format_memory(),
+                            memory_block=self._format_memory(goal),
                             error_block=local_error,
                             tool_docs=tools.load_tool_docs(),
                             app_list=self._apps_str,
                             observation=observation,
+                            focused_app=focused_app or "unknown",
                             history_block=self._history.text_summary()),
                 "Generate the next action.", image=b64)
             self._push_tokens()
@@ -634,6 +650,8 @@ class Orchestrator:
 
                 if inline:
                     self._log(f"    📦 [{tb_name}] (inline: {len(inline)} actions)")
+                    # Focus guard: warn if window-control hotkey has no prior activate
+                    sub_list = self._inject_focus_guard(inline)
                     sub_list = inline
                 elif tools.exists(tb_name):
                     self._log(f"    📦 [{tb_name}] {tb_params}")
@@ -656,6 +674,7 @@ class Orchestrator:
                         val       = call_llm(load_prompt("reader", target=tgt), "Extract.", image=b64_r)
                         self._push_tokens()
                         self.state.set_memory(skey, val)
+                        self._vmem.add(skey, val, image_b64=b64_r)
                         self._log(f"        👁️  {skey}: {val[:100]}")
                     else:
                         img = take_screenshot(self.screen)[1] if sub["type"] in ("click", "doubleclick") else None
@@ -670,10 +689,13 @@ class Orchestrator:
                 val       = call_llm(load_prompt("reader", target=tgt), "Extract.", image=b64_r)
                 self._push_tokens()
                 self.state.set_memory(skey, val)
+                self._vmem.add(skey, val, image_b64=b64_r)
                 self._log(f"    👁️  {skey}: {val[:100]}")
 
             elif atype == "memory":
-                self.state.set_memory(action["key"], action["value"])
+                key, val = action["key"], action["value"]
+                self.state.set_memory(key, val)
+                self._vmem.add(key, val)
 
             else:
                 img = take_screenshot(self.screen)[1] if atype in ("click", "doubleclick") else None
@@ -688,11 +710,43 @@ class Orchestrator:
     # Helpers
     # ──────────────────────────────────────────────────────────────────
 
-    def _format_memory(self) -> str:
+    def _format_memory(self, goal: str = "") -> str:
         if not self.state or not self.state.memory:
             return ""
+
+        # Semantic retrieval: find memories most relevant to the current goal
+        if goal and len(self._vmem) > 0:
+            results = self._vmem.search(goal, k=6)
+            if results:
+                lines = [
+                    f"  [{r['key']}] ({r['score']:.2f}): {r['text'][:200]}"
+                    for r in results
+                    # Only show entries that are actually in state.memory (skip obs_* entries)
+                    if r["key"] in self.state.memory
+                ]
+                if lines:
+                    return "Memory (relevant):\n" + "\n".join(lines)
+
+        # Fallback: recency-based (no vmem entries yet or no goal provided)
         lines = [f"  [{k}]: {v[:200]}" for k, v in list(self.state.memory.items())[-8:]]
         return "Memory:\n" + "\n".join(lines)
+
+    _WINDOW_HOTKEYS = {"cmd w", "cmd q", "cmd m", "cmd h"}
+
+    def _inject_focus_guard(self, sub_list: list[dict]) -> list[dict]:
+        """Log a warning if a window-control hotkey appears without a prior activate."""
+        has_activate = False
+        for sub in sub_list:
+            if sub["type"] == "applescript":
+                has_activate = True
+            if sub["type"] == "hotkey":
+                norm = " ".join(sorted(k.strip().lower()
+                                       for k in sub["keys"].replace("+", " ").split()))
+                if norm in self._WINDOW_HOTKEYS and not has_activate:
+                    focused = get_focus()
+                    self._log(f"    ⚠️  Focus guard: '{sub['keys']}' without prior activate "
+                              f"(current focus: '{focused}')")
+        return sub_list
 
     @staticmethod
     def _extract_grounded_coords(actions: list[dict]) -> tuple[int | None, int | None]:
